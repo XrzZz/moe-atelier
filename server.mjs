@@ -229,6 +229,8 @@ const readJsonFile = async (filePath, fallback) => {
   }
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
 const writeJsonFileAtomic = async (filePath, data) => {
   const dir = path.dirname(filePath)
   const baseName = path.basename(filePath)
@@ -262,6 +264,21 @@ const writeJsonFileAtomic = async (filePath, data) => {
       } catch (retryErr) {
         if (!retryErr || retryErr.code !== 'ENOENT') {
           throw retryErr
+        }
+      }
+      await fs.promises.writeFile(filePath, payload, { encoding: 'utf-8' })
+      return
+    }
+    if (err && ['EPERM', 'EACCES', 'EBUSY'].includes(err.code)) {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await sleep(30 * (attempt + 1))
+        try {
+          await fs.promises.rename(tempPath, filePath)
+          return
+        } catch (retryErr) {
+          if (!retryErr || !['EPERM', 'EACCES', 'EBUSY'].includes(retryErr.code)) {
+            throw retryErr
+          }
         }
       }
       await fs.promises.writeFile(filePath, payload, { encoding: 'utf-8' })
@@ -401,31 +418,55 @@ const scheduleOrphanCleanup = () => {
   }, ORPHAN_CLEANUP_DELAY_MS)
 }
 
+const MIN_BASE64_LENGTH = 256
+const BASE64_CONTENT_REGEX = /^[A-Za-z0-9+/]+={0,2}$/
+const INLINE_IMAGE_DATA_REGEX =
+  /(?:data:|[a-z0-9.+-]+:)?image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/i
+
+const normalizeBase64Payload = (value) => {
+  const compact = value.replace(/\s+/g, '')
+  if (compact.length < MIN_BASE64_LENGTH) return null
+  if (!BASE64_CONTENT_REGEX.test(compact)) return null
+  return compact
+}
+
 const normalizeImageUrl = (value) => {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()
   if (!trimmed) return null
   if (/^https?:\/\//i.test(trimmed)) return trimmed
-  if (/^data:image\//i.test(trimmed)) return trimmed
   const imagePrefixMatch = trimmed.match(
-    /^(?:[a-z0-9.+-]+:)?(image\/[a-z0-9.+-]+;base64,)/i
+    /^(?:[a-z0-9.+-]+:)?(image\/[a-z0-9.+-]+;base64,)([\s\S]+)$/i
   )
   if (imagePrefixMatch) {
-    return `data:${imagePrefixMatch[1]}${trimmed.slice(imagePrefixMatch[0].length)}`
+    const payload = normalizeBase64Payload(imagePrefixMatch[2])
+    if (!payload) return null
+    return `data:${imagePrefixMatch[1]}${payload}`
   }
-  const base64Pattern = /^[A-Za-z0-9+/]+={0,2}$/
-  if (base64Pattern.test(trimmed)) {
-    return `data:image/png;base64,${trimmed}`
+  const base64Payload = normalizeBase64Payload(trimmed)
+  if (base64Payload) {
+    return `data:image/png;base64,${base64Payload}`
   }
   return null
 }
 
-const parseMarkdownImage = (text = '') => {
-  const mdImageRegex = /!\[.*?\]\((.*?)\)/
+const extractImageFromText = (text = '') => {
+  if (!text) return null
+  const mdImageRegex = /!\[[\s\S]*?\]\(([\s\S]*?)\)/
   const match = text.match(mdImageRegex)
-  if (match && match[1]) return match[1]
+  if (match && match[1]) {
+    const normalized = normalizeImageUrl(match[1])
+    if (normalized) return normalized
+  }
+  const inlineMatch = text.match(INLINE_IMAGE_DATA_REGEX)
+  if (inlineMatch) {
+    const normalized = normalizeImageUrl(inlineMatch[0])
+    if (normalized) return normalized
+  }
   return normalizeImageUrl(text)
 }
+
+const parseMarkdownImage = (text = '') => extractImageFromText(text)
 
 const extractImageFromMessage = (message) => {
   if (!message) return null
@@ -433,7 +474,10 @@ const extractImageFromMessage = (message) => {
     for (const part of message.content) {
       if (part?.type === 'image_url') {
         const url = part?.image_url?.url || part?.image_url
-        if (url) return url
+        if (url) {
+          const normalized = normalizeImageUrl(url)
+          if (normalized) return normalized
+        }
       }
       if (part?.type === 'text' && typeof part.text === 'string') {
         const imageUrl = parseMarkdownImage(part.text)
@@ -456,20 +500,21 @@ const resolveImageFromResponse = (data) => {
   const resultUrl = data?.resultUrl ?? data?.result_url
   if (typeof resultUrl === 'string') {
     const normalized = normalizeImageUrl(resultUrl)
-    return normalized || resultUrl
+    if (normalized) return normalized
   }
   const fromDataArray = data?.data?.[0]
   if (fromDataArray) {
     if (typeof fromDataArray === 'string') {
       const normalized = normalizeImageUrl(fromDataArray)
-      return normalized || fromDataArray
+      if (normalized) return normalized
     }
     if (fromDataArray.url) {
       const normalized = normalizeImageUrl(fromDataArray.url)
-      return normalized || fromDataArray.url
+      if (normalized) return normalized
     }
     if (fromDataArray.b64_json) {
-      return `data:image/png;base64,${fromDataArray.b64_json}`
+      const normalized = normalizeImageUrl(fromDataArray.b64_json)
+      if (normalized) return normalized
     }
   }
   return extractImageFromMessage(data?.choices?.[0]?.message)
@@ -629,25 +674,39 @@ const requestImageUrl = async (config, messages, signal) => {
     const reader = response.body?.getReader()
     const decoder = new TextDecoder()
     let generatedText = ''
+    let pending = ''
+    const consumeLine = (line) => {
+      const cleaned = line.replace(/\r$/, '')
+      if (!cleaned.startsWith('data:')) return
+      const payload = cleaned.slice(5).trimStart()
+      if (!payload || payload === '[DONE]') return
+      try {
+        const json = JSON.parse(payload)
+        const delta = json.choices?.[0]?.delta
+        if (delta?.content) generatedText += delta.content
+        if (delta?.reasoning_content) generatedText += delta.reasoning_content
+      } catch {
+        // ignore chunk parse errors
+      }
+    }
     if (reader) {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        const chunk = decoder.decode(value, { stream: true })
-        const lines = chunk.split('\n')
-        for (const line of lines) {
-          if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-            try {
-              const json = JSON.parse(line.slice(6))
-              const delta = json.choices?.[0]?.delta
-              if (delta?.content) generatedText += delta.content
-              if (delta?.reasoning_content) generatedText += delta.reasoning_content
-            } catch {
-              // ignore chunk parse errors
-            }
-          }
+        pending += decoder.decode(value, { stream: true })
+        let newlineIndex = pending.indexOf('\n')
+        while (newlineIndex >= 0) {
+          const line = pending.slice(0, newlineIndex)
+          pending = pending.slice(newlineIndex + 1)
+          consumeLine(line)
+          newlineIndex = pending.indexOf('\n')
         }
       }
+      const tail = decoder.decode()
+      if (tail) pending += tail
+    }
+    if (pending) {
+      consumeLine(pending)
     }
     const imageUrl = parseMarkdownImage(generatedText)
     if (!imageUrl) {

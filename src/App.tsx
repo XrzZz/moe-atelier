@@ -959,15 +959,15 @@ function App() {
             </Form.Item>
             
             <div style={{ background: '#F8F9FA', padding: '16px', borderRadius: 16, marginBottom: 24, border: '1px solid #eee' }}>
-              <Form.Item 
-                name="stream" 
+              <Form.Item
                 label={<span style={{ fontWeight: 700, color: '#665555' }}>流式传输</span>}
-                valuePropName="checked"
                 style={{ marginBottom: 0 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <Text type="secondary" style={{ fontSize: 13 }}>启用实时生成进度更新</Text>
-                  <Switch />
+                  <Form.Item name="stream" valuePropName="checked" noStyle>
+                    <Switch />
+                  </Form.Item>
                 </div>
               </Form.Item>
             </div>

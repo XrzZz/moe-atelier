@@ -905,24 +905,38 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         const reader = fetchResponse.body?.getReader();
         const decoder = new TextDecoder();
         let generatedText = '';
+        let pending = '';
+        const consumeLine = (line: string) => {
+          const cleaned = line.replace(/\r$/, '');
+          if (!cleaned.startsWith('data:')) return;
+          const payload = cleaned.slice(5).trimStart();
+          if (!payload || payload === '[DONE]') return;
+          try {
+            const json = JSON.parse(payload);
+            const delta = json.choices?.[0]?.delta;
+            if (delta?.content) generatedText += delta.content;
+            if (delta?.reasoning_content) generatedText += delta.reasoning_content;
+          } catch (e) { /* ignore */ }
+        };
 
         if (reader) {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-                try {
-                  const json = JSON.parse(line.slice(6));
-                  const delta = json.choices?.[0]?.delta;
-                  if (delta?.content) generatedText += delta.content;
-                  if (delta?.reasoning_content) generatedText += delta.reasoning_content;
-                } catch (e) { /* ignore */ }
-              }
+            pending += decoder.decode(value, { stream: true });
+            let newlineIndex = pending.indexOf('\n');
+            while (newlineIndex >= 0) {
+              const line = pending.slice(0, newlineIndex);
+              pending = pending.slice(newlineIndex + 1);
+              consumeLine(line);
+              newlineIndex = pending.indexOf('\n');
             }
           }
+          const tail = decoder.decode();
+          if (tail) pending += tail;
+        }
+        if (pending) {
+          consumeLine(pending);
         }
         imageUrl = parseMarkdownImage(generatedText);
       } else {
