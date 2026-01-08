@@ -1,8 +1,30 @@
+export type SafetySettings = Record<string, string>;
+
+export interface ImageConfig {
+  imageSize: string;
+  aspectRatio: string;
+}
+
 export interface AppConfig {
   apiUrl: string;
   apiKey: string;
   model: string;
+  apiFormat: 'openai' | 'gemini' | 'vertex';
+  apiVersion: string;
+  vertexProjectId?: string;
+  vertexLocation?: string;
+  vertexPublisher?: string;
   stream: boolean;
+  enableCollection: boolean;
+  thinkingBudget: number;
+  includeThoughts: boolean;
+  includeImageConfig: boolean;
+  includeSafetySettings: boolean;
+  safety: SafetySettings;
+  imageConfig: ImageConfig;
+  webpQuality: number;
+  useResponseModalities: boolean;
+  customJson: string;
 }
 
 export interface TaskConfig {

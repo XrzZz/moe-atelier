@@ -34,6 +34,8 @@ export interface PersistedUploadImage {
   size?: number;
   lastModified?: number;
   localKey: string;
+  fromCollection?: boolean;
+  sourceSignature?: string;
 }
 
 export interface PersistedImageTaskState {

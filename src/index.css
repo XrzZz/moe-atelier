@@ -51,6 +51,13 @@
   --moe-dot-bg-position: 0 0, 20px 20px;
 }
 
+html {
+  background-color: var(--c-bg);
+  background-image: var(--moe-dot-bg-image);
+  background-size: var(--moe-dot-bg-size);
+  background-position: var(--moe-dot-bg-position);
+}
+
 body {
   margin: 0;
   padding: 0;
@@ -286,6 +293,60 @@ body {
   color: #D0C0C0;
 }
 
+/* Collection drawer handle integration */
+.collection-drawer .ant-drawer-content-wrapper {
+  overflow: visible;
+  display: block !important;
+}
+
+.collection-drawer .ant-drawer-content-wrapper-hidden {
+  display: block !important;
+  transform: translateX(100%) !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+}
+
+.collection-drawer .ant-drawer-content-wrapper-hidden .collection-drawer-panel {
+  display: none;
+}
+
+.collection-drawer.collection-drawer-unopened .ant-drawer-content-wrapper {
+  transform: translateX(100%);
+}
+
+.collection-drawer.collection-drawer-unopened .collection-drawer-panel {
+  display: none;
+}
+
+.collection-drawer-shell {
+  position: relative;
+  height: 100%;
+}
+
+.collection-drawer-panel {
+  height: 100%;
+}
+
+.collection-drawer-handle {
+  position: absolute;
+  left: -20px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  cursor: pointer;
+  pointer-events: auto;
+  filter: drop-shadow(-2px 2px 4px rgba(0, 0, 0, 0.1));
+  clip-path: inset(-20px 0px -20px -20px);
+}
+
+.collection-drawer-handle-icon {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-30%, -50%);
+  color: #665555;
+}
+
 /* Header 响应式优化 */
 .app-header {
   padding: 0 24px !important;
@@ -397,4 +458,32 @@ body {
 .model-autocomplete.ant-select-single .ant-select-selector {
   height: auto;
   align-items: center;
+}
+
+/* Collection Box 卡片样式 */
+.collection-card {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.collection-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 20px rgba(255, 143, 171, 0.25) !important;
+}
+
+/* Collection Box 自定义滚动条 */
+.collection-drawer .ant-drawer-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.collection-drawer .ant-drawer-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.collection-drawer .ant-drawer-body::-webkit-scrollbar-thumb {
+  background: #FFC2D1;
+  border-radius: 3px;
+}
+
+.collection-drawer .ant-drawer-body::-webkit-scrollbar-thumb:hover {
+  background: #FF8FAB;
 }

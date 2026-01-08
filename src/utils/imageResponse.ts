@@ -49,6 +49,42 @@ const extractImageFromText = (text: string): string | null => {
 export const parseMarkdownImage = (text: string): string | null =>
   extractImageFromText(text);
 
+const extractImageFromGeminiPart = (part: any): string | null => {
+  if (!part) return null;
+  const inlineData = part.inline_data || part.inlineData;
+  const fileData = part.file_data || part.fileData;
+  if (inlineData?.data) {
+    const mimeType = inlineData.mime_type || inlineData.mimeType || 'image/png';
+    const payload = normalizeBase64Payload(String(inlineData.data));
+    if (payload) {
+      return `data:${mimeType};base64,${payload}`;
+    }
+  }
+  if (fileData?.file_uri || fileData?.fileUri) {
+    const uri = fileData.file_uri || fileData.fileUri;
+    const normalized = normalizeImageUrl(uri);
+    if (normalized) return normalized;
+  }
+  if (typeof part.text === 'string') {
+    const imageUrl = parseMarkdownImage(part.text);
+    if (imageUrl) return imageUrl;
+  }
+  return null;
+};
+
+const extractImageFromGeminiCandidates = (candidates: any[]): string | null => {
+  for (const candidate of candidates) {
+    const parts = candidate?.content?.parts;
+    if (Array.isArray(parts)) {
+      for (const part of parts) {
+        const image = extractImageFromGeminiPart(part);
+        if (image) return image;
+      }
+    }
+  }
+  return null;
+};
+
 const extractImageFromMessage = (message: any): string | null => {
   if (!message) return null;
   if (Array.isArray(message.content)) {
@@ -82,6 +118,10 @@ export const resolveImageFromResponse = (data: any): string | null => {
   if (typeof resultUrl === 'string') {
     const normalized = normalizeImageUrl(resultUrl);
     if (normalized) return normalized;
+  }
+  if (Array.isArray(data?.candidates)) {
+    const image = extractImageFromGeminiCandidates(data.candidates);
+    if (image) return image;
   }
   const fromDataArray = data?.data?.[0];
   if (fromDataArray) {

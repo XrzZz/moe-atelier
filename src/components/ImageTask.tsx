@@ -23,10 +23,18 @@ import type {
   SubTaskResult,
   PersistedUploadImage,
 } from '../types/imageTask';
+import type { CollectionItem } from '../types/collection';
 import { DEFAULT_TASK_STATS, loadTaskState, saveTaskState, serializeResults, TASK_STATE_VERSION } from './imageTaskState';
 import { getBase64 } from '../utils/file';
 import { parseMarkdownImage, resolveImageFromResponse } from '../utils/imageResponse';
 import { openImageDb, IMAGE_STORE_NAME } from '../utils/imageDb';
+import {
+  extractVertexProjectId,
+  inferApiVersionFromUrl,
+  normalizeApiBase,
+  resolveApiUrl,
+  resolveApiVersion,
+} from '../utils/apiUrl';
 import { calculateSuccessRate, formatDuration } from '../utils/stats';
 import {
   buildBackendImageUrl,
@@ -50,6 +58,8 @@ interface ImageTaskProps {
   backendMode: boolean;
   onRemove: () => void;
   onStatsUpdate: (type: 'request' | 'success' | 'fail', duration?: number) => void;
+  onCollect?: (item: CollectionItem) => void;
+  collectionRevision?: number;
   dragAttributes?: any;
   dragListeners?: any;
 }
@@ -59,6 +69,8 @@ const DEFAULT_CONCURRENCY = 2;
 type UploadFileWithMeta = UploadFile & {
   localKey?: string;
   lastModified?: number;
+  fromCollection?: boolean;
+  sourceSignature?: string;
 };
 
 const normalizeStoredResult = (item: PersistedSubTaskResult, backendMode: boolean): SubTaskResult => {
@@ -89,6 +101,8 @@ const serializeUploads = (uploads: UploadFileWithMeta[]): PersistedUploadImage[]
       size: file.size ?? file.originFileObj?.size,
       lastModified: file.lastModified ?? file.originFileObj?.lastModified,
       localKey: file.localKey as string,
+      fromCollection: file.fromCollection,
+      sourceSignature: file.sourceSignature,
     }));
 
 const normalizeUploadsPayload = (uploads: PersistedUploadImage[] = []) =>
@@ -99,6 +113,8 @@ const normalizeUploadsPayload = (uploads: PersistedUploadImage[] = []) =>
     size: item.size,
     lastModified: item.lastModified,
     localKey: item.localKey,
+    fromCollection: item.fromCollection,
+    sourceSignature: item.sourceSignature,
   }));
 
 const normalizeConcurrency = (value: unknown, fallback = DEFAULT_CONCURRENCY) => {
@@ -106,7 +122,7 @@ const normalizeConcurrency = (value: unknown, fallback = DEFAULT_CONCURRENCY) =>
   return Math.max(1, Math.floor(value));
 };
 
-const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMode, onRemove, onStatsUpdate, dragAttributes, dragListeners }: ImageTaskProps) => {
+const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMode, onRemove, onStatsUpdate, onCollect, collectionRevision, dragAttributes, dragListeners }: ImageTaskProps) => {
   const [prompt, setPrompt] = useState('');
   const promptRef = useRef(prompt);
   const promptDirtyRef = useRef(false);
@@ -133,6 +149,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const cachedUploadKeysRef = useRef<Set<string>>(new Set());
   const backendPersistTimerRef = useRef<number | null>(null);
   const backendLastPayloadRef = useRef<string>('');
+  const collectedCollectionKeysRef = useRef<Set<string>>(new Set());
+  const lastCollectionRevisionRef = useRef(collectionRevision);
 
   const withBackendToken = (url: string) => {
     const cleaned = stripBackendToken(url);
@@ -153,6 +171,12 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         : sourceUrl;
     }
     return undefined;
+  };
+
+  const extractBackendImageKey = (url?: string) => {
+    if (!url) return undefined;
+    const match = url.match(/\/api\/backend\/image\/([^?]+)/);
+    return match ? decodeURIComponent(match[1]) : undefined;
   };
 
   const applyBackendTaskState = (
@@ -202,16 +226,29 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     setResults(hydratedResults);
 
     if (!options.preserveUploads) {
-      const hydratedUploads: UploadFileWithMeta[] = storedUploads.map((item) => ({
-        uid: item.uid,
-        name: item.name,
-        status: 'done',
-        size: item.size,
-        type: item.type,
-        lastModified: item.lastModified,
-        localKey: item.localKey,
-        thumbUrl: item.localKey ? buildBackendImageUrl(item.localKey) : undefined,
-      }));
+      const hydratedUploads: UploadFileWithMeta[] = storedUploads.map((item) => {
+        const signature =
+          item.sourceSignature ||
+          buildUploadSignature({
+            uid: item.uid,
+            name: item.name,
+            size: item.size,
+            lastModified: item.lastModified,
+            type: item.type,
+          } as UploadFileWithMeta);
+        return {
+          uid: item.uid,
+          name: item.name,
+          status: 'done',
+          size: item.size,
+          type: item.type,
+          lastModified: item.lastModified,
+          localKey: item.localKey,
+          thumbUrl: item.localKey ? buildBackendImageUrl(item.localKey) : undefined,
+          fromCollection: item.fromCollection,
+          sourceSignature: signature || item.sourceSignature,
+        };
+      });
       setFileList(hydratedUploads);
     }
   };
@@ -280,6 +317,15 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
             const objectUrl = URL.createObjectURL(blob);
             registerObjectUrl(item.localKey, objectUrl);
             cachedUploadKeysRef.current.add(item.localKey);
+            const signature =
+              item.sourceSignature ||
+              buildUploadSignature({
+                uid: item.uid,
+                name: item.name,
+                size: item.size ?? rcFile.size,
+                lastModified: item.lastModified ?? rcFile.lastModified,
+                type: item.type ?? rcFile.type,
+              } as UploadFileWithMeta);
             hydratedUploads.push({
               uid: item.uid,
               name: item.name,
@@ -290,6 +336,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
               originFileObj: rcFile,
               thumbUrl: objectUrl,
               localKey: item.localKey,
+              fromCollection: item.fromCollection,
+              sourceSignature: signature || item.sourceSignature,
             });
           }
           if (isActive) {
@@ -408,6 +456,48 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   }, [results, backendMode, enableSound]);
 
   useEffect(() => {
+    collectedCollectionKeysRef.current.clear();
+  }, [id]);
+
+  useEffect(() => {
+    if (collectionRevision === undefined) return;
+    if (lastCollectionRevisionRef.current === collectionRevision) return;
+    lastCollectionRevisionRef.current = collectionRevision;
+    Array.from(collectedCollectionKeysRef.current).forEach((key) => {
+      if (key.startsWith('collection:upload:')) {
+        collectedCollectionKeysRef.current.delete(key);
+      }
+    });
+  }, [collectionRevision]);
+
+  useEffect(() => {
+    if (!backendMode || !config.enableCollection || !onCollect) return;
+    const currentPrompt = promptRef.current;
+    results.forEach((result) => {
+      if (result.status !== 'success') return;
+      const endTime =
+        typeof result.endTime === 'number' ? result.endTime : result.startTime;
+      if (!endTime) return;
+      const collectionKey = buildResultCollectionKey(result.id, endTime);
+      const resolvedSourceUrl =
+        resolveBackendDisplayUrl(result.localKey, result.sourceUrl) ||
+        result.displayUrl ||
+        result.sourceUrl;
+      void collectImageForCollection({
+        collectionKey,
+        sourceUrl: resolvedSourceUrl || undefined,
+        sourceLocalKey: result.localKey,
+        prompt: currentPrompt,
+        timestamp: endTime,
+        taskId: id,
+      });
+    });
+    if (results.some((result) => result.status === 'success')) {
+      collectReferenceImagesForCollection();
+    }
+  }, [backendMode, config.enableCollection, onCollect, results, id]);
+
+  useEffect(() => {
     if (!hydrated || backendMode) return;
     let isActive = true;
     const persistUploads = async () => {
@@ -512,6 +602,22 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   };
 
   const buildUploadKey = (uid: string) => `${storageKey}:upload:${uid}`;
+  const buildResultCollectionKey = (subTaskId: string, endTime: number) =>
+    `collection:result:${subTaskId}:${endTime}`;
+  const buildUploadCollectionKey = (taskId: string, uploadKey: string) =>
+    `collection:upload:${taskId}:${uploadKey}`;
+  const buildUploadSignature = (file: UploadFileWithMeta) => {
+    const name = typeof file.name === 'string' ? file.name : '';
+    const size = file.size ?? file.originFileObj?.size;
+    const lastModified = file.lastModified ?? file.originFileObj?.lastModified;
+    const type = file.type ?? file.originFileObj?.type;
+    if (!name || typeof size !== 'number' || typeof lastModified !== 'number') {
+      return '';
+    }
+    return `${name}:${size}:${lastModified}:${type || ''}`;
+  };
+  const isCollectionUploadKey = (key?: string) =>
+    Boolean(key && key.startsWith('collection:upload:'));
 
   const getImageDb = () => {
     if (typeof indexedDB === 'undefined') return null;
@@ -568,6 +674,434 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     } catch (err) {
       console.warn('Failed to remove cached image:', err);
     }
+  };
+
+  const fetchImageBlob = async (sourceUrl: string): Promise<Blob | null> => {
+    try {
+      const response = await fetch(sourceUrl);
+      if (!response.ok) return null;
+      return await response.blob();
+    } catch (err) {
+      console.warn('读取图片数据失败:', err);
+      return null;
+    }
+  };
+
+  const collectImageForCollection = async (options: {
+    collectionKey: string;
+    sourceUrl?: string;
+    sourceLocalKey?: string;
+    sourceBlob?: Blob;
+    sourceSignature?: string;
+    prompt: string;
+    timestamp: number;
+    taskId: string;
+  }) => {
+    if (!config.enableCollection || !onCollect) return;
+    if (collectedCollectionKeysRef.current.has(options.collectionKey)) return;
+
+    if (backendMode) {
+      const backendLocalKey =
+        options.sourceLocalKey || extractBackendImageKey(options.sourceUrl);
+      if (!backendLocalKey) return;
+      collectedCollectionKeysRef.current.add(options.collectionKey);
+      onCollect({
+        id: options.collectionKey,
+        prompt: options.prompt,
+        timestamp: options.timestamp,
+        taskId: options.taskId,
+        localKey: backendLocalKey,
+        sourceSignature: options.sourceSignature,
+      });
+      return;
+    }
+
+    collectedCollectionKeysRef.current.add(options.collectionKey);
+    let blob: Blob | null = null;
+    if (options.sourceBlob) {
+      blob = options.sourceBlob;
+    } else if (options.sourceLocalKey) {
+      blob = await getImageBlob(options.sourceLocalKey);
+    }
+    if (!blob && options.sourceUrl) {
+      blob = await fetchImageBlob(options.sourceUrl);
+    }
+
+    let localKey: string | undefined;
+    if (blob) {
+      await saveImageBlob(options.collectionKey, blob);
+      localKey = options.collectionKey;
+    }
+
+    onCollect({
+      id: localKey || options.collectionKey,
+      prompt: options.prompt,
+      image: options.sourceUrl,
+      timestamp: options.timestamp,
+      taskId: options.taskId,
+      localKey,
+      sourceSignature: options.sourceSignature,
+    });
+  };
+
+  const collectReferenceImagesForCollection = () => {
+    if (!config.enableCollection || !onCollect) return;
+    if (fileList.length === 0) return;
+    const currentPrompt = promptRef.current;
+    fileList.forEach((file) => {
+      if (file.fromCollection || isCollectionUploadKey(file.localKey)) return;
+      const signature = file.sourceSignature || buildUploadSignature(file);
+      const uploadKey = file.uid || file.localKey;
+      if (!uploadKey) return;
+      if (backendMode && !file.localKey) return;
+      const collectionKey = buildUploadCollectionKey(id, uploadKey);
+      const sourceBlob = file.originFileObj as Blob | undefined;
+      const sourceUrl = typeof file.thumbUrl === 'string' ? file.thumbUrl : undefined;
+      void collectImageForCollection({
+        collectionKey,
+        sourceBlob,
+        sourceLocalKey: file.localKey,
+        sourceUrl,
+        sourceSignature: signature || undefined,
+        prompt: currentPrompt,
+        timestamp: Date.now(),
+        taskId: id,
+      });
+    });
+  };
+
+  const apiMarkerSegments = new Set(['projects', 'locations', 'publishers', 'models']);
+  const apiVersionPattern = /^v1(?:beta1|beta)?$/i;
+  const isVersionSegment = (value?: string) =>
+    Boolean(value && apiVersionPattern.test(value));
+
+  const normalizeBase64Payload = (value: string) => value.replace(/\s+/g, '');
+  const clampNumber = (value: number, min: number, max: number) =>
+    Math.min(max, Math.max(min, value));
+
+  const splitDataUrl = (value: string) => {
+    const match = value.match(/^data:(.+?);base64,(.*)$/i);
+    if (!match) {
+      return { mimeType: '', data: normalizeBase64Payload(value) };
+    }
+    return { mimeType: match[1], data: normalizeBase64Payload(match[2]) };
+  };
+
+  const resolveWebpQuality = () => {
+    if (typeof config.webpQuality !== 'number' || Number.isNaN(config.webpQuality)) {
+      return null;
+    }
+    return clampNumber(Math.round(config.webpQuality), 50, 100);
+  };
+
+  const convertDataUrlToWebp = (dataUrl: string, quality: number) =>
+    new Promise<{ mimeType: string; data: string }>((resolve, reject) => {
+      const img = document.createElement('img');
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.naturalWidth || img.width;
+          canvas.height = img.naturalHeight || img.height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            reject(new Error('Canvas context is unavailable'));
+            return;
+          }
+          ctx.drawImage(img, 0, 0);
+          const webpDataUrl = canvas.toDataURL('image/webp', quality);
+          const parts = webpDataUrl.split(';base64,');
+          if (parts.length !== 2) {
+            reject(new Error('Unexpected WebP data URL format'));
+            return;
+          }
+          resolve({
+            mimeType: parts[0].split(':')[1] || 'image/webp',
+            data: parts[1],
+          });
+        } catch (err) {
+          reject(err);
+        }
+      };
+      img.onerror = () => reject(new Error('Failed to decode image for WebP conversion'));
+      img.src = dataUrl;
+    });
+
+  const maybeConvertToWebp = async (dataUrl: string) => {
+    const { mimeType, data } = splitDataUrl(dataUrl);
+    const normalized = normalizeBase64Payload(data);
+    if (!mimeType || mimeType.toLowerCase() === 'image/webp') {
+      return { mimeType: mimeType || 'image/png', data: normalized };
+    }
+    const quality = resolveWebpQuality();
+    if (!quality) {
+      return { mimeType: mimeType || 'image/png', data: normalized };
+    }
+    try {
+      const webp = await convertDataUrlToWebp(
+        `data:${mimeType};base64,${normalized}`,
+        clampNumber(quality / 100, 0.1, 1),
+      );
+      return {
+        mimeType: webp.mimeType,
+        data: normalizeBase64Payload(webp.data),
+      };
+    } catch (err) {
+      console.warn('WebP conversion failed, using original image.', err);
+      return { mimeType: mimeType || 'image/png', data: normalized };
+    }
+  };
+
+  const buildGeminiContents = async () => {
+    const parts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> = [];
+    const promptText = promptRef.current.trim();
+    if (promptText) {
+      parts.push({ text: promptText });
+    }
+    for (const file of fileList) {
+      if (!file.originFileObj) continue;
+      const base64 = await getBase64(file.originFileObj);
+      const converted = await maybeConvertToWebp(base64);
+      const resolvedMime = converted.mimeType || file.type || 'image/png';
+      const payload = normalizeBase64Payload(converted.data);
+      parts.push({ inline_data: { mime_type: resolvedMime, data: payload } });
+    }
+    return [{ role: 'user', parts }];
+  };
+
+  const buildGeminiGenerationConfig = () => {
+    const generationConfig: Record<string, unknown> = {};
+    if (config.includeImageConfig) {
+      const imageSize = config.imageConfig?.imageSize || '2K';
+      const aspectRatio = config.imageConfig?.aspectRatio || 'auto';
+      const imageConfig: Record<string, string> = { imageSize };
+      if (aspectRatio && aspectRatio !== 'auto') {
+        imageConfig.aspectRatio = aspectRatio;
+      }
+      generationConfig.imageConfig = imageConfig;
+      if (config.useResponseModalities) {
+        generationConfig.responseModalities = ['TEXT', 'IMAGE'];
+      }
+    }
+    if (config.includeThoughts) {
+      const budget = clampNumber(
+        Math.round(typeof config.thinkingBudget === 'number' ? config.thinkingBudget : 128),
+        0,
+        8192,
+      );
+      generationConfig.thinkingConfig = {
+        thinkingBudget: budget,
+        includeThoughts: true,
+      };
+    }
+    return Object.keys(generationConfig).length > 0 ? generationConfig : null;
+  };
+
+  const buildGeminiSafetySettings = () => {
+    if (!config.includeSafetySettings || !config.safety) return null;
+    const entries = Object.entries(config.safety).filter(
+      ([, threshold]) => threshold && threshold !== 'OFF',
+    );
+    if (entries.length === 0) return null;
+    return entries.map(([category, threshold]) => ({
+      category,
+      threshold,
+    }));
+  };
+
+  const mergeGeminiCustomJson = (payload: Record<string, unknown>) => {
+    const raw = typeof config.customJson === 'string' ? config.customJson.trim() : '';
+    if (!raw) return payload;
+    try {
+      const custom = JSON.parse(raw);
+      if (!custom || typeof custom !== 'object' || Array.isArray(custom)) {
+        return payload;
+      }
+      const mergedGenerationConfig = {
+        ...(payload.generationConfig as Record<string, unknown> | undefined),
+        ...(custom.generationConfig || {}),
+      };
+      return {
+        ...payload,
+        ...custom,
+        generationConfig:
+          Object.keys(mergedGenerationConfig).length > 0 ? mergedGenerationConfig : undefined,
+        safetySettings: custom.safetySettings ?? payload.safetySettings,
+      };
+    } catch (err) {
+      console.warn('自定义 JSON 解析失败，已忽略。', err);
+      return payload;
+    }
+  };
+
+  const buildGeminiPayload = (contents: Array<Record<string, unknown>>) => {
+    const payload: Record<string, unknown> = { contents };
+    const generationConfig = buildGeminiGenerationConfig();
+    if (generationConfig) {
+      payload.generationConfig = generationConfig;
+    }
+    const safetySettings = buildGeminiSafetySettings();
+    if (safetySettings) {
+      payload.safetySettings = safetySettings;
+    }
+    return mergeGeminiCustomJson(payload);
+  };
+
+  const buildGeminiRequest = () => {
+    const apiFormat = config.apiFormat || 'openai';
+    const format = apiFormat === 'vertex' ? 'vertex' : 'gemini';
+    const apiUrl = resolveApiUrl(config.apiUrl, format);
+    const baseInfo = normalizeApiBase(apiUrl);
+    const baseOrigin = baseInfo.origin || apiUrl.replace(/\/+$/, '');
+    const versionFallback = format === 'vertex' ? 'v1beta1' : 'v1beta';
+    const version = resolveApiVersion(apiUrl, config.apiVersion, versionFallback);
+    const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl));
+    const segments = [...baseInfo.segments];
+
+    if (!hasVersion && version) {
+      const markerIndex = segments.findIndex((segment) => apiMarkerSegments.has(segment));
+      if (markerIndex >= 0) {
+        segments.splice(markerIndex, 0, version);
+      } else {
+        segments.push(version);
+      }
+    }
+
+    const modelValue = config.model.trim();
+    if (!modelValue) {
+      throw new Error('请填写模型名称');
+    }
+
+    const modelSegments = modelValue.split('/').filter(Boolean);
+    const modelHasProjectPath = modelSegments.includes('projects');
+    const geminiModelIsPath = modelSegments[0] === 'models';
+    const normalizedModel = geminiModelIsPath ? modelSegments.slice(1).join('/') : modelValue;
+
+    const applyModelPath = () => {
+      const modelIndex = segments.indexOf('models');
+      if (geminiModelIsPath) {
+        if (modelIndex >= 0 && modelSegments[0] === 'models') {
+          segments.splice(modelIndex + 1);
+          segments.push(...modelSegments.slice(1));
+        } else {
+          segments.push(...modelSegments);
+        }
+        return;
+      }
+      if (modelIndex >= 0) {
+        segments.splice(modelIndex + 1);
+        segments.push(modelValue);
+      } else {
+        segments.push('models', modelValue);
+      }
+    };
+
+    const ensureMarkerValue = (marker: string, value?: string) => {
+      const idx = segments.indexOf(marker);
+      if (idx === -1) {
+        if (!value) return false;
+        segments.push(marker, value);
+        return true;
+      }
+      const next = segments[idx + 1];
+      if (!next || apiMarkerSegments.has(next) || isVersionSegment(next)) {
+        if (!value) return false;
+        segments.splice(idx + 1, 0, value);
+        return true;
+      }
+      return true;
+    };
+
+    if (format === 'vertex') {
+      const projectId =
+        config.vertexProjectId?.trim() || extractVertexProjectId(apiUrl) || '';
+      const location = config.vertexLocation?.trim() || 'us-central1';
+      const publisher = config.vertexPublisher?.trim() || 'google';
+      const hasProjectsMarker = segments.includes('projects');
+      const useVertexMarkers = Boolean(projectId || hasProjectsMarker || modelHasProjectPath);
+
+      if (modelHasProjectPath) {
+        segments.push(...modelSegments);
+      } else if (useVertexMarkers) {
+        if (projectId) {
+          ensureMarkerValue('projects', projectId);
+        }
+        if (segments.includes('projects') || projectId) {
+          ensureMarkerValue('locations', location);
+          ensureMarkerValue('publishers', publisher);
+        }
+        if (segments.includes('projects') || projectId) {
+          ensureMarkerValue('models', normalizedModel);
+        } else {
+          applyModelPath();
+        }
+      } else {
+        applyModelPath();
+      }
+    } else {
+      applyModelPath();
+    }
+
+    const suffix = config.stream ? ':streamGenerateContent' : ':generateContent';
+    let url = `${baseOrigin}${segments.length ? `/${segments.join('/')}` : ''}${suffix}`;
+    const headers: HeadersInit = { 'Content-Type': 'application/json' };
+    const isOfficial =
+      format === 'vertex'
+        ? baseInfo.host === 'aiplatform.googleapis.com'
+        : baseInfo.host === 'generativelanguage.googleapis.com';
+    if (isOfficial) {
+      url += `${url.includes('?') ? '&' : '?'}key=${encodeURIComponent(config.apiKey)}`;
+    } else {
+      headers.Authorization = `Bearer ${config.apiKey}`;
+    }
+    return { url, headers };
+  };
+
+  const readGeminiStream = async (response: Response) => {
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return response.json();
+    }
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let lastJson: any = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex = buffer.indexOf('\n');
+      while (newlineIndex >= 0) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf('\n');
+        if (!line) continue;
+        const cleaned = line.replace(/^data:\s*/i, '').trim();
+        if (!cleaned || cleaned === '[DONE]') continue;
+        try {
+          lastJson = JSON.parse(cleaned);
+        } catch {
+          // ignore partial lines
+        }
+      }
+    }
+
+    const tail = decoder.decode();
+    if (tail) {
+      buffer += tail;
+    }
+    const remainder = buffer.trim();
+    if (remainder) {
+      const cleaned = remainder.replace(/^data:\s*/i, '').trim();
+      if (cleaned && cleaned !== '[DONE]') {
+        try {
+          lastJson = JSON.parse(cleaned);
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    return lastJson;
   };
 
   const registerObjectUrl = (key: string, url: string) => {
@@ -854,98 +1388,124 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     const startTime = taskStartTimesRef.current.get(subTaskId) || Date.now();
 
     try {
-      const baseUrl = config.apiUrl.replace(/\/+$/, '');
+      const apiFormat = config.apiFormat || 'openai';
       const hasImage = fileList.length > 0;
-
-      const messages: any[] = [];
-      const content: any[] = [];
-      if (prompt) {
-        content.push({ type: 'text', text: prompt });
-      }
-      if (hasImage) {
-        // 支持多图上传，将所有图片添加到 content 中
-        for (const file of fileList) {
-          if (file.originFileObj) {
-            const base64 = await getBase64(file.originFileObj);
-            content.push({
-              type: 'image_url',
-              image_url: {
-                url: base64,
-              },
-            });
-          }
-        }
-      }
-      messages.push({
-        role: 'user',
-        content,
-      });
-      messages.push({
-        role: 'user',
-        content: ' ',
-      });
-
-      const headers = {
-        'Authorization': `Bearer ${config.apiKey}`,
-        'x-api-key': config.apiKey,
-      };
-
       let imageUrl: string | null = null;
-      
-      if (config.stream) {
-        const fetchResponse = await fetch(`${baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers: { ...headers, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: config.model, messages, stream: true }),
-          signal: controller.signal,
-        });
 
-        if (!fetchResponse.ok) throw new Error(fetchResponse.statusText);
+      if (apiFormat === 'openai') {
+        const apiUrl = resolveApiUrl(config.apiUrl, 'openai');
+        const baseInfo = normalizeApiBase(apiUrl);
+        const basePath = baseInfo.origin
+          ? `${baseInfo.origin}${baseInfo.segments.length ? `/${baseInfo.segments.join('/')}` : ''}`
+          : apiUrl.replace(/\/+$/, '');
+        const version = resolveApiVersion(apiUrl, config.apiVersion, 'v1');
+        const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl));
+        const openAiBase = hasVersion ? basePath : `${basePath}/${version}`;
+        const chatUrl = openAiBase.endsWith('/chat/completions')
+          ? openAiBase
+          : `${openAiBase}/chat/completions`;
 
-        const reader = fetchResponse.body?.getReader();
-        const decoder = new TextDecoder();
-        let generatedText = '';
-        let pending = '';
-        const consumeLine = (line: string) => {
-          const cleaned = line.replace(/\r$/, '');
-          if (!cleaned.startsWith('data:')) return;
-          const payload = cleaned.slice(5).trimStart();
-          if (!payload || payload === '[DONE]') return;
-          try {
-            const json = JSON.parse(payload);
-            const delta = json.choices?.[0]?.delta;
-            if (delta?.content) generatedText += delta.content;
-            if (delta?.reasoning_content) generatedText += delta.reasoning_content;
-          } catch (e) { /* ignore */ }
-        };
-
-        if (reader) {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            pending += decoder.decode(value, { stream: true });
-            let newlineIndex = pending.indexOf('\n');
-            while (newlineIndex >= 0) {
-              const line = pending.slice(0, newlineIndex);
-              pending = pending.slice(newlineIndex + 1);
-              consumeLine(line);
-              newlineIndex = pending.indexOf('\n');
+        const messages: any[] = [];
+        const content: any[] = [];
+        if (prompt) {
+          content.push({ type: 'text', text: prompt });
+        }
+        if (hasImage) {
+          for (const file of fileList) {
+            if (file.originFileObj) {
+              const base64 = await getBase64(file.originFileObj);
+              content.push({
+                type: 'image_url',
+                image_url: {
+                  url: base64,
+                },
+              });
             }
           }
-          const tail = decoder.decode();
-          if (tail) pending += tail;
         }
-        if (pending) {
-          consumeLine(pending);
+        messages.push({
+          role: 'user',
+          content,
+        });
+        const headers = {
+          'Authorization': `Bearer ${config.apiKey}`,
+          'x-api-key': config.apiKey,
+        };
+
+        if (config.stream) {
+          const fetchResponse = await fetch(chatUrl, {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: config.model, messages, stream: true }),
+            signal: controller.signal,
+          });
+
+          if (!fetchResponse.ok) throw new Error(fetchResponse.statusText);
+
+          const reader = fetchResponse.body?.getReader();
+          const decoder = new TextDecoder();
+          let generatedText = '';
+          let pending = '';
+          const consumeLine = (line: string) => {
+            const cleaned = line.replace(/\r$/, '');
+            if (!cleaned.startsWith('data:')) return;
+            const payload = cleaned.slice(5).trimStart();
+            if (!payload || payload === '[DONE]') return;
+            try {
+              const json = JSON.parse(payload);
+              const delta = json.choices?.[0]?.delta;
+              if (delta?.content) generatedText += delta.content;
+              if (delta?.reasoning_content) generatedText += delta.reasoning_content;
+            } catch (e) { /* ignore */ }
+          };
+
+          if (reader) {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              pending += decoder.decode(value, { stream: true });
+              let newlineIndex = pending.indexOf('\n');
+              while (newlineIndex >= 0) {
+                const line = pending.slice(0, newlineIndex);
+                pending = pending.slice(newlineIndex + 1);
+                consumeLine(line);
+                newlineIndex = pending.indexOf('\n');
+              }
+            }
+            const tail = decoder.decode();
+            if (tail) pending += tail;
+          }
+          if (pending) {
+            consumeLine(pending);
+          }
+          imageUrl = parseMarkdownImage(generatedText);
+        } else {
+          const response = await axios.post(
+            chatUrl,
+            { model: config.model, messages, stream: false },
+            { headers: { ...headers, 'Content-Type': 'application/json' }, signal: controller.signal }
+          );
+          imageUrl = resolveImageFromResponse(response.data);
         }
-        imageUrl = parseMarkdownImage(generatedText);
       } else {
-        const response = await axios.post(
-          `${baseUrl}/chat/completions`,
-          { model: config.model, messages, stream: false },
-          { headers: { ...headers, 'Content-Type': 'application/json' }, signal: controller.signal }
-        );
-        imageUrl = resolveImageFromResponse(response.data);
+        const contents = await buildGeminiContents();
+        const { url, headers } = buildGeminiRequest();
+        const payload = buildGeminiPayload(contents);
+        const response = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        const data = config.stream ? await readGeminiStream(response) : await response.json();
+        if (!response.ok) {
+          const errorMessage =
+            data?.error?.message ||
+            (typeof data === 'string' ? data : '') ||
+            response.statusText;
+          throw new Error(errorMessage);
+        }
+        imageUrl = resolveImageFromResponse(data);
       }
       
       if (imageUrl) {
@@ -954,6 +1514,20 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         const { displayUrl, localKey } = await persistImageLocally(imageUrl, subTaskId);
         updateResult(subTaskId, { status: 'success', displayUrl, localKey, sourceUrl: imageUrl, savedLocal: false, endTime, duration });
         updateStats('success', duration);
+        
+        if (config.enableCollection && onCollect) {
+          const collectionKey = buildResultCollectionKey(subTaskId, endTime);
+          await collectImageForCollection({
+            collectionKey,
+            sourceUrl: imageUrl,
+            sourceLocalKey: localKey,
+            prompt: promptRef.current,
+            timestamp: endTime,
+            taskId: id,
+          });
+          collectReferenceImagesForCollection();
+        }
+
         playSuccessSound();
         isRetryingRef.current.set(subTaskId, false);
       } else {
@@ -1035,8 +1609,21 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   };
 
   const handleUploadChange = ({ fileList: newFileList }: { fileList: UploadFile[] }) => {
+    const fromCollectionMap = new Map(
+      fileList.map((file) => [file.uid, file.fromCollection]),
+    );
+    const signatureMap = new Map(
+      fileList.map((file) => [file.uid, file.sourceSignature]),
+    );
     const normalized = newFileList.map((file) => {
       const next = { ...file, originFileObj: file.originFileObj } as UploadFileWithMeta;
+      if (fromCollectionMap.get(next.uid)) {
+        next.fromCollection = true;
+      }
+      const existingSignature = signatureMap.get(next.uid);
+      if (existingSignature) {
+        next.sourceSignature = existingSignature;
+      }
       if (file.originFileObj && !next.originFileObj) {
         next.originFileObj = file.originFileObj;
       }
@@ -1053,6 +1640,12 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         next.type = next.type || next.originFileObj.type;
         next.size = next.size ?? next.originFileObj.size;
         next.lastModified = next.lastModified ?? next.originFileObj.lastModified;
+      }
+      if (!next.sourceSignature) {
+        const signature = buildUploadSignature(next);
+        if (signature) {
+          next.sourceSignature = signature;
+        }
       }
       if (!next.status) {
         next.status = 'done';

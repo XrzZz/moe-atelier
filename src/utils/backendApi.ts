@@ -1,4 +1,5 @@
 import type { AppConfig } from '../types/app';
+import type { CollectionItem } from '../types/collection';
 import type { GlobalStats } from '../types/stats';
 import type { PersistedImageTaskState } from '../types/imageTask';
 import { safeStorageGet, safeStorageRemove, safeStorageSet } from './storage';
@@ -93,6 +94,15 @@ export const patchBackendState = async (payload: Partial<BackendState>) =>
     body: payload,
   });
 
+export const fetchBackendCollection = async () =>
+  backendJson<CollectionItem[]>('/api/backend/collection');
+
+export const putBackendCollection = async (items: CollectionItem[]) =>
+  backendJson<CollectionItem[]>('/api/backend/collection', {
+    method: 'PUT',
+    body: items,
+  });
+
 export const fetchBackendTask = async (taskId: string) =>
   backendJson<PersistedImageTaskState>(`/api/backend/task/${encodeURIComponent(taskId)}`);
 
@@ -113,6 +123,11 @@ export const patchBackendTask = async (
 
 export const deleteBackendTask = async (taskId: string) =>
   backendJson<{ ok: true }>(`/api/backend/task/${encodeURIComponent(taskId)}`, {
+    method: 'DELETE',
+  });
+
+export const deleteBackendImage = async (key: string) =>
+  backendJson<{ ok: true }>(`/api/backend/image/${encodeURIComponent(key)}`, {
     method: 'DELETE',
   });
 

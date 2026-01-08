@@ -897,7 +897,6 @@ const PromptDrawer: React.FC<PromptDrawerProps> = ({ visible, onClose, onCreateT
         ::-webkit-scrollbar-thumb:hover {
           background: #FF8FAB;
         }
-        
         .custom-search-input.ant-input-affix-wrapper {
           border-radius: 50px;
           border: 1px solid #FFE5EC;
