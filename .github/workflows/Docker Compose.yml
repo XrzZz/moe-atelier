@@ -1,0 +1,20 @@
+version: "3.8"
+
+ services:
+   app:
+    # 替换 build 为 image
+     image: ghcr.io/fshebe233/moe-atelier:latest
+     ports:
+       - "5173:5173"
+     environment:
+       - PORT=5173
+      # 别忘了你的密码！
+       - BACKEND_PASSWORD=your_secure_password
+     volumes:
+       - saved-images:/app/saved-images
+       - server-data:/app/server-data
+     restart: unless-stopped
+
+ volumes:
+   saved-images:
+   server-data:
